@@ -1,307 +1,329 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import requests
-import ConfigParser
+import configparser
 import time
-import sys
 import os
 import random
 import string
+import json
+import logging
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict, Any
 
-reload(sys)
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-sys.setdefaultencoding('utf-8')
 
+class TelegramBot:
+    """Класс для работы с Telegram Bot API"""
 
+    def __init__(self, config_path: str = 'telebot.cfg'):
+        self.config = self._load_config(config_path)
+        self.api_url = self.config['api_url']
+        self.bot_token = self.config['secret']
+        self.admin_id = self.config['admin_id']
+        self.interval = self.config['interval']
+        self.offset = self.config['offset']
 
+        # Создание необходимых директорий
+        self._setup_directories()
 
-class api_req:  # Класс для get/post из telegram api
+    def _load_config(self, config_path: str) -> Dict[str, Any]:
+        """Загрузка конфигурации"""
+        config = configparser.ConfigParser()
 
-    def __init__(self, interval, admin_id, api_url, secret, offset, text, chat_id, chat_name):
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"Config file {config_path} not found")
 
-        self.interval = interval
-        self.admin_id = admin_id
-        self.api_url = api_url
-        self.secret = secret
-        self.offset = offset
-        self.text = text
-        self.chat_id = chat_id
-        self.chat_name = chat_name
+        config.read(config_path, encoding='utf-8')
 
-    def request_executor(self):
+        return {
+            'interval': config.getfloat('SectionBot', 'interval'),
+            'admin_id': config.getint('SectionBot', 'admin_id'),
+            'api_url': config.get('SectionBot', 'api_url'),
+            'secret': config.get('SectionBot', 'secret'),
+            'offset': config.getint('SectionBot', 'offset')
+        }
 
-        self.options = {'offset': self.offset + 1, 'limit': 5, 'timeout': 0}
+    def _setup_directories(self):
+        """Создание необходимых директорий"""
+        directories = ['chatlogs', 'dict', 'tmp']
+        for directory in directories:
+            Path(directory).mkdir(exist_ok=True)
+
+    def get_updates(self) -> Optional[List[Dict]]:
+        """Получение обновлений от Telegram API"""
+        params = {
+            'offset': self.offset + 1,
+            'limit': 100,
+            'timeout': 30
+        }
 
         try:
+            response = requests.get(
+                f"{self.api_url}{self.bot_token}/getUpdates",
+                params=params,
+                timeout=35
+            )
+            response.raise_for_status()
+            data = response.json()
 
-            self.request = requests.get(self.api_url + self.secret + '/getUpdates', data=self.options)
+            if data.get('ok') and data.get('result'):
+                updates = data['result']
+                if updates:
+                    self.offset = updates[-1]['update_id']
+                return updates
 
-        except:
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error getting updates: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing JSON: {e}")
 
-            print('Error getting updates')
+        return None
+
+    def send_message(self, chat_id: int, text: str) -> bool:
+        """Отправка сообщения"""
+        payload = {
+            'chat_id': chat_id,
+            'text': text,
+            'parse_mode': 'HTML'
+        }
+
+        try:
+            response = requests.post(
+                f"{self.api_url}{self.bot_token}/sendMessage",
+                json=payload,
+                timeout=10
+            )
+            response.raise_for_status()
+            logger.info(f"Sent to {chat_id}: {text[:50]}...")
+            return True
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error sending message: {e}")
             return False
 
-        if not self.request.status_code == 200:
+    def extract_message_info(self, update: Dict) -> Optional[Tuple]:
+        """Извлечение информации из обновления"""
+        if 'message' not in update or 'text' not in update['message']:
+            return None
 
-            return False
+        message = update['message']
+        chat = message['chat']
+        from_user = message.get('from', {})
 
-        if not self.request.json()['ok']:
+        # ID чата
+        chat_id = chat['id']
 
-            return False
+        # Тип чата
+        chat_type = chat.get('type', 'private')
 
-        if self.request.json()['result']:
-
-            return self.request.json()['result']
-
+        # Имя пользователя/чата
+        if chat_type == 'group' or chat_type == 'supergroup':
+            chat_name = chat.get('title', f'Chat {chat_id}')
         else:
+            first_name = from_user.get('first_name', '')
+            last_name = from_user.get('last_name', '')
+            chat_name = f"{first_name} {last_name}".strip() or f"User {from_user.get('id', '')}"
+
+        # Текст сообщения
+        text = message['text']
+
+        # Логирование
+        user_name = f"{first_name} {last_name}".strip() or f"User {from_user.get('id', '')}"
+        self.log_event(f"Message from {user_name}: {text}", chat_name)
+
+        return (text, chat_id, chat_name, chat_id)
+
+    def log_event(self, text: str, logname: str):
+        """Логирование событий"""
+        # Очистка имени файла от недопустимых символов
+        safe_name = ''.join(c for c in logname if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        if not safe_name:
+            safe_name = 'unknown'
+
+        filename = f'chatlogs/{safe_name}_log.txt'
+
+        try:
+            with open(filename, 'a', encoding='utf-8') as f:
+                f.write(f"{time.ctime()} >> {text}\n")
+        except IOError as e:
+            logger.error(f"Error writing log: {e}")
+
+    def learn_phrase(self, phrase: str, chat_number: str):
+        """Обучение бота - сохранение фразы"""
+        safe_chat_id = str(chat_number).replace('+', '').replace('-', '')
+        phrase = phrase.replace('/learn', '').strip()
+
+        if not phrase:
+            return
+
+        filename = f'dict/{safe_chat_id}_words.dat'
+
+        try:
+            with open(filename, 'a', encoding='utf-8') as f:
+                f.write(f"{phrase}\n")
+            logger.info(f"Learned phrase for chat {safe_chat_id}")
+        except IOError as e:
+            logger.error(f"Error saving phrase: {e}")
+
+    @staticmethod
+    def longest_common_substring(s1: str, s2: str) -> str:
+        """Поиск наибольшей общей подстроки"""
+        m = len(s1)
+        n = len(s2)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        max_len = 0
+        end_pos = 0
+
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if s1[i - 1] == s2[j - 1]:
+                    dp[i][j] = dp[i - 1][j - 1] + 1
+                    if dp[i][j] > max_len:
+                        max_len = dp[i][j]
+                        end_pos = i
+
+        return s1[end_pos - max_len:end_pos] if max_len > 0 else ""
+
+    def find_similar_phrases(self, message: str, chat_number: str) -> Optional[str]:
+        """Поиск похожих фраз в словаре"""
+        safe_chat_id = str(chat_number).replace('+', '').replace('-', '')
+        filename = f'dict/{safe_chat_id}_words.dat'
+
+        if not os.path.exists(filename):
+            return None
+
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                phrases = [line.strip() for line in f if line.strip()]
+        except IOError:
+            return None
+
+        if not phrases:
+            return None
+
+        # Очистка сообщения
+        message_words = message.lower().translate(
+            str.maketrans('', '', string.punctuation)
+        ).split()
+
+        matched_phrases = []
+
+        for phrase in phrases:
+            # Проверка на точное совпадение слов
+            phrase_words = phrase.lower().translate(
+                str.maketrans('', '', string.punctuation)
+            ).split()
+
+            # Проверяем совпадение хотя бы одного слова на 80%
+            for msg_word in message_words:
+                for phr_word in phrase_words:
+                    common = self.longest_common_substring(msg_word, phr_word)
+                    if len(common) >= 0.8 * len(phr_word):
+                        matched_phrases.append(phrase)
+                        break
+                if phrase in matched_phrases:
+                    break
+
+        if matched_phrases:
+            return random.choice(matched_phrases)
+
+        return None
+
+    def process_message(self, message: str, chat_name: str, chat_number: str) -> Optional[str]:
+        """Обработка входящего сообщения"""
+        # Обработка команд
+        if message.startswith('/'):
+            parts = message.split(' ', 1)
+            command = parts[0].lower()
+
+            if command == '/help':
+                return "Telebot - Simple Telegram Bot\nCommands:\n/help - Show help\n/learn <phrase> - Teach bot a phrase\n/start - Start bot"
+
+            elif command == '/stop':
+                return "Bot stopped"
+
+            elif command == '/start':
+                return "Bot started!"
+
+            elif command == '/learn' and len(parts) > 1:
+                self.learn_phrase(parts[1], chat_number)
+                return "Phrase learned!"
+
+        # Поиск похожих фраз
+        response = self.find_similar_phrases(message, chat_number)
+        return response
+
+    def run(self):
+        """Основной цикл бота"""
+        logger.info("Starting Telegram bot...")
+
+        # Проверка блокировки
+        lock_file = 'tmp/telebot.lock'
+        if os.path.exists(lock_file):
+            logger.warning("Lock file exists. Another instance may be running.")
+            try:
+                # Проверяем, активен ли процесс
+                with open(lock_file, 'r') as f:
+                    pid = f.read().strip()
+                    # Простая проверка (для Linux)
+                    if os.path.exists(f'/proc/{pid}'):
+                        logger.error("Bot is already running. Exiting.")
+                        return
+            except:
+                pass
+
+        # Создание lock файла
+        try:
+            with open(lock_file, 'w') as f:
+                f.write(str(os.getpid()))
+        except IOError as e:
+            logger.error(f"Cannot create lock file: {e}")
+            return
+
+        try:
+            while True:
+                try:
+                    updates = self.get_updates()
+
+                    if updates:
+                        for update in updates:
+                            message_info = self.extract_message_info(update)
+                            if message_info:
+                                text, chat_id, chat_name, chat_number = message_info
+                                response = self.process_message(text, chat_name, chat_number)
+
+                                if response:
+                                    self.send_message(chat_id, response)
+
+                    time.sleep(self.interval)
+
+                except KeyboardInterrupt:
+                    logger.info("Bot stopped by user")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in main loop: {e}")
+                    time.sleep(self.interval * 2)  # Увеличенная пауза при ошибке
+
+        finally:
+            # Удаление lock файла
+            try:
+                os.remove(lock_file)
+            except:
+                pass
+            logger.info("Bot stopped")
 
-            return False
-
-    def post_executor(self):
-
-        log_event('Sending to %s: %s' % (self.chat_name, self.text), self.chat_name)
-        self.options = {'chat_id': self.chat_id, 'text': self.text}
-        self.request = requests.post(self.api_url + self.secret + '/sendMessage', self.options)
-
-        if not self.request.status_code == 200:
-
-            return False
-
-        return self.request.json()['ok']
-
-
-def message_extraction(message_body):  # Выковыриваем из ответа сообщение
-
-    if type(message_body) == str or int:  # Иногда приезжает булевый тип данных, ломая итерацию. Избавляемся.
-
-        global offset
-
-        for update in message_body:
-
-            offset = update['update_id']
-
-            if not 'message' in update or not 'text' in update['message']:
-
-                log_event('Unknown update: %s' % (update), "error")
-                continue
-
-            from_id = update['message']['chat']['id']
-            chat_number = update['message']['chat']['id']
-            chat_type = update['message']['chat']['type']
-
-            if not 'first_name' in update['message']['from']:   # Проверка наличия имени и фамилии пользователя, они не всегда бывают.
-
-                name = update['message']['from']['last_name']
-                print(name)
-
-            if not 'last_name' in update['message']['from']:
-
-                name = update['message']['from']['first_name']
-
-            else:
-
-                name = update['message']['from']['first_name'] + ' ' + update['message']['from']['last_name']
-
-            if chat_type == "group":    # Определяем имя чата для последующей записи в лог.
-
-                chat_name = update['message']['chat']['title']
-
-            elif chat_type == "private":
-
-                chat_name = name
-
-            message = update['message']['text']  # Вытаскиваем текст сообщения.
-            log_event('Message from %s: %s' % (name, message), chat_name)
-            return (message, from_id, chat_name, chat_number)  # Возвращаем сообщение и идентификаторы чата
-
-
-def log_event(text, logname):
-
-    filename = 'chatlogs/'+logname+'_log.txt'
-    event = '%s >> %s' % (time.ctime(), text)
-    filework = open(filename, 'a+')
-    filework.write(event)
-    filework.write("\n")
-    filework.close()
-
-
-def learner(message_text, chat_number):
-
-    chat_number = str(chat_number)
-    chat_number = chat_number.replace('+', '').replace('-', '')
-    message_text = message_text.replace('/learn', '').strip()
-    filework = open('dict/' + chat_number + '_words.dat', 'a')
-    filework.write(message_text)
-    filework.write("\n")
-    filework.close()
-
-
-def longestSubstringFinder(string1, string2):
-    """
-    string1 is for word in dictionary
-    string2 is for word in message
-    """
-    answer = ""
-    len1, len2 = len(string1), len(string2)
-    for i in range(len1):
-        match = ""
-        for j in range(len2):
-            if (i + j < len1 and string1[i + j] == string2[j]):
-                match += string2[j]
-            else:
-                if (len(match) > len(answer)): answer = match
-                match = ""
-
-    return len(answer) >= 0.8 * len(string1)
-
-
-def compare_words_lists(filelist, message):
-    """
-	filelist is for words in file
-	message list is for message words
-    """
-    matched = []
-    for f in filelist:
-	   for w in message:
-	       if longestSubstringFinder(f, w):
-                matched.append(f)
-    return matched
-	
-
-def messager_test(message_word,chat_name,chat_number):
-
-    message_word_command = message_word.split(" ")
-
-    if message_word_command[0] == '/help':
-
-        return "Telebot - Simple Telegram bot"
-
-    elif message_word_command[0] == '/stop':
-
-        return "Hui tebe!"
-
-    elif message_word_command[0] == '/start':
-
-        return "OK"
-
-    elif message_word_command[0] == '/learn':
-
-        learner(message_word, chat_number)
-        return "Записал!"
-
-    try:
-        chat_number = str(chat_number)
-        chat_number = chat_number.replace('+', '').replace('-', '')
-        words_file = open('dict/' + chat_number + '_words.dat', 'r')
-
-    except:
-
-        return False
-
-    message_word = message_word.encode('utf-8', 'ignore')  # Извлекаем слово, убираем пунктуацию, переводим в нижний регистр и загоняем в список по пробелам
-    message_word_truncated = message_word.translate(string.maketrans("",""), string.punctuation).decode('utf-8').lower().split(" ")
-    string_with_words = []
-
-    if message_word_truncated[0] == '':
-        return False
-
-    for strings in words_file:
-        counter = 0
-        list_original = strings.split(" || ")
-        list_spl = strings.decode('utf-8').lower().split(" || ")  # Получаем строку из файла, делим ее по разделителю и переводим в нижний регистр
-        list_spl_truncated = list_spl[:]
-
-        for elements in list_spl:
-
-            list_spl_truncated[counter] = list_spl[counter].encode('utf-8', 'ignore').translate(string.maketrans("", ""), string.punctuation).decode('utf-8')  # Удаляем пунктуацию, получаем чистый список
-            counter += 1
-
-        list_diff = compare_words_lists(list_spl_truncated, message_word_truncated)  # получаем точки пресечения списков
-
-        if list_diff:
-            string_with_words = string_with_words + list_original  # Собираем значения, совпавшие со строками списков в один список.
-
-    if string_with_words:
-
-        rnd = random.randint(1, len(string_with_words)-1)  # Из образовавшегося набора рандомно выбираем фразу или слово, как повезет.
-
-        words_file.close()
-
-        return string_with_words[rnd]
-
-    else:
-
-        return False
-
-#  Парсим конфигурацию
-
-config = ConfigParser.RawConfigParser()
-config.read('telebot.cfg')
-
-try:
-
-    interval = config.getfloat('SectionBot', 'interval')
-    admin_id = config.getint('SectionBot', 'admin_id')
-    api_url = config.get('SectionBot', 'api_url')
-    secret = config.get('SectionBot', 'secret')
-    offset = config.getint('SectionBot', 'offset')
-    lock_file = 'tmp/telebot.lock'
-    text = 'Hello'
-    chat_id = 0
-
-except:
-
-    print("Can't parse config file!")
-    exit(0)
 
 if __name__ == "__main__":
-
-    if os.path.exists(lock_file):
-
-        print('Lock file exists!')
-        #exit(0)
-
-    else:
-
-        try:
-
-            open(lock_file, 'a+')
-            lock_file.close()
-
-        except:
-
-            exit(0)
-
-    while True:
-
-        try:
-
-            chat_name = 0
-            answ_data = False
-            message_data = False
-            test = api_req(interval, admin_id, api_url, secret, offset, text, chat_id, chat_name)
-
-            data_test = test.request_executor()
-
-            if data_test:
-
-                message_data = message_extraction(data_test)
-
-            if message_data:
-
-                message, from_id, chat_name, chat_number = message_data
-                answ = messager_test(message, chat_name, chat_number)
-
-                if answ:
-
-                    runn = api_req(interval, admin_id, api_url, secret, offset, answ, from_id, chat_name)
-                    runn.post_executor()
-
-            time.sleep(interval)
-
-        except KeyboardInterrupt:
-
-            print('Прервано пользователем..')
-            os.remove(lock_file)
-            break
+    try:
+        bot = TelegramBot()
+        bot.run()
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}")
